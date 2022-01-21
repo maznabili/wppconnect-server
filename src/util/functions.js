@@ -18,11 +18,17 @@ import path from 'path';
 import fs from 'fs';
 import { promisify } from 'util';
 import { convert } from '../mapper/index';
+import config from '../config.json';
+
+let mime = config.webhook.uploadS3 ? require('mime-types') : null;
+let crypto = config.webhook.uploadS3 ? require('crypto') : null;
+let aws = config.webhook.uploadS3 ? require('aws-sdk') : null;
 
 export function contactToArray(number, isGroup) {
   let localArr = [];
   if (Array.isArray(number)) {
-    for (const contact of number) {
+    for (let contact of number) {
+      contact = contact.split('@')[0];
       if (contact !== '')
         if (isGroup) localArr.push(`${contact}@g.us`);
         else localArr.push(`${contact}@c.us`);
@@ -30,7 +36,7 @@ export function contactToArray(number, isGroup) {
   } else {
     let arrContacts = number.split(/\s*[,;]\s*/g);
     for (let contact of arrContacts) {
-      contact = number.split('@')[0];
+      contact = contact.split('@')[0];
       if (contact !== '')
         if (isGroup) localArr.push(`${contact}@g.us`);
         else localArr.push(`${contact}@c.us`);
@@ -43,12 +49,14 @@ export function contactToArray(number, isGroup) {
 export function groupToArray(group) {
   let localArr = [];
   if (Array.isArray(group)) {
-    for (const contact of group) {
+    for (let contact of group) {
+      contact = contact.split('@')[0];
       if (contact !== '') localArr.push(`${contact}@g.us`);
     }
   } else {
     let arrContacts = group.split(/\s*[,;]\s*/g);
-    for (const contact of arrContacts) {
+    for (let contact of arrContacts) {
+      contact = contact.split('@')[0];
       if (contact !== '') localArr.push(`${contact}@g.us`);
     }
   }
@@ -73,20 +81,23 @@ export function groupNameToArray(group) {
 }
 
 export async function callWebHook(client, req, event, data) {
-  if (client && client.webhook) {
-    if (req.serverOptions.webhook.autoDownload) await autoDownload(client, data);
+  const webhook = client?.config.webhook || req.serverOptions.webhook.url || false;
+  if (webhook) {
+    if (req.serverOptions.webhook.autoDownload) await autoDownload(client, req, data);
     try {
+      const chatId = data.from || data.chatId || (data.chatId ? data.chatId._serialized : null);
       data = Object.assign({ event: event, session: client.session }, data);
-      data = await convert(data);
+      if (req.serverOptions.mapper.enable) data = await convert(req.serverOptions.mapper.prefix, data);
       api
-        .post(client.webhook, data)
+        .post(webhook, data)
         .then(() => {
-          const events = ['unreadmessages', 'onmessage'];
-          if (events.includes(event) && req.serverOptions.webhook.readMessage)
-            client.sendSeen(data.chatId._serialized || data.from || data.chatId);
+          try {
+            const events = ['unreadmessages', 'onmessage'];
+            if (events.includes(event) && req.serverOptions.webhook.readMessage) client.sendSeen(chatId);
+          } catch (e) {}
         })
         .catch((e) => {
-          req.logger.warn('Error calling Webhook.');
+          req.logger.warn('Error calling Webhook.', e);
         });
     } catch (e) {
       req.logger.error(e);
@@ -94,10 +105,27 @@ export async function callWebHook(client, req, event, data) {
   }
 }
 
-async function autoDownload(client, message) {
+async function autoDownload(client, req, message) {
   if (message && (message['mimetype'] || message.isMedia || message.isMMS)) {
     let buffer = await client.decryptFile(message);
-    message.body = await buffer.toString('base64');
+    if (req.serverOptions.webhook.uploadS3) {
+      var hashName = crypto.randomBytes(24).toString('hex');
+      var fileName = `${hashName}.${mime.extension(message.mimetype)}`;
+
+      const s3 = new aws.S3();
+
+      var params = {
+        Bucket: client.session,
+        Key: fileName,
+        Body: buffer,
+        ACL: 'public-read',
+        ContentType: message.mimetype,
+      };
+      const data = await s3.upload(params).promise();
+      message.fileUrl = data.Location;
+    } else {
+      message.body = await buffer.toString('base64');
+    }
   }
 }
 
@@ -175,12 +203,12 @@ function DaysBetween(StartDate) {
 
 export function createFolders() {
   const __dirname = path.resolve(path.dirname(''));
-  let dirFiles = path.resolve(__dirname, '..', '..', 'WhatsAppImages');
+  let dirFiles = path.resolve(__dirname, 'WhatsAppImages');
   if (!fs.existsSync(dirFiles)) {
     fs.mkdirSync(dirFiles);
   }
 
-  let dirUpload = path.resolve(__dirname, '..', '..', 'uploads');
+  let dirUpload = path.resolve(__dirname, 'uploads');
   if (!fs.existsSync(dirUpload)) {
     fs.mkdirSync(dirUpload);
   }
@@ -188,6 +216,18 @@ export function createFolders() {
 
 export function strToBool(s) {
   return /^(true|1)$/i.test(s);
+}
+
+export function getIPAddress() {
+  var interfaces = require('os').networkInterfaces();
+  for (var devName in interfaces) {
+    var iface = interfaces[devName];
+    for (var i = 0; i < iface.length; i++) {
+      var alias = iface[i];
+      if (alias.family === 'IPv4' && alias.address !== '127.0.0.1' && !alias.internal) return alias.address;
+    }
+  }
+  return '0.0.0.0';
 }
 
 export let unlinkAsync = promisify(fs.unlink);

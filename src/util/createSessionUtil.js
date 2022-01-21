@@ -13,46 +13,56 @@
  * See the License for the specific language governing permissions and
  * limitations under the License.
  */
-import { clientsArray } from './sessionUtil';
-import { create, SocketState, tokenStore } from '@wppconnect-team/wppconnect';
+import { clientsArray, eventEmitter } from './sessionUtil';
+import { create, SocketState } from '@wppconnect-team/wppconnect';
 import { callWebHook, startHelper } from './functions';
 import { download } from '../controller/sessionController';
-import fs from 'fs';
-/*import FileTokenStoreCreator from './tokenStore/fileTokenStoreCreator';
-import MongodbTokenStoreCreator from './tokenStore/mongodbTokenStoreCreator';
-import RedisTokenStoreCreator from './tokenStore/redisTokenStoreCreator';
-import * as redis from 'redis';
-import Token from "./tokenStore/model/token";
-import { reject } from 'lodash';*/
 import Factory from './tokenStore/factory';
+import chatWootClient from './chatWootClient';
 
 export default class CreateSessionUtil {
+  startChatWootClient(client) {
+    if (client.config.chatWoot && !client._chatWootClient)
+      client._chatWootClient = new chatWootClient(client.config.chatWoot, client.session);
+    return client._chatWootClient;
+  }
+
   async createSessionUtil(req, clientsArray, session, res) {
     try {
-      let { webhook } = req.body;
-      webhook = webhook === undefined ? req.serverOptions.webhook.url : webhook;
-
       let client = this.getClient(session);
       if (client.status != null && client.status !== 'CLOSED') return;
       client.status = 'INITIALIZING';
-      client.webhook = webhook;
+      client.config = req.body;
 
       const tokenStore = new Factory();
       const myTokenStore = tokenStore.createTokenStory(client);
 
+      await myTokenStore.getToken(session);
+      this.startChatWootClient(client);
+
+      if (req.serverOptions.customUserDataDir) {
+        req.serverOptions.createOptions.puppeteerOptions = {
+          userDataDir: req.serverOptions.customUserDataDir + session,
+        };
+      }
+
       let wppClient = await create(
         Object.assign({}, { tokenStore: myTokenStore }, req.serverOptions.createOptions, {
           session: session,
+          deviceName: req.serverOptions.deviceName,
           catchQR: (base64Qr, asciiQR, attempt, urlCode) => {
             this.exportQR(req, base64Qr, urlCode, client, res);
           },
           statusFind: (statusFind) => {
             try {
+              eventEmitter.emit(`status-${client.session}`, client, statusFind);
               if (statusFind === 'autocloseCalled' || statusFind === 'desconnectedMobile') {
                 client.status = 'CLOSED';
                 client.qrcode = null;
-                client.waPage.close();
+                client.close();
+                clientsArray[session] = undefined;
               }
+              callWebHook(client, req, 'status-find', { status: statusFind });
               req.logger.info(statusFind + '\n\n');
             } catch (error) {}
           },
@@ -75,6 +85,7 @@ export default class CreateSessionUtil {
   }
 
   exportQR(req, qrCode, urlCode, client, res) {
+    eventEmitter.emit(`qrcode-${client.session}`, qrCode, urlCode, client);
     Object.assign(client, {
       status: 'QRCODE',
       qrcode: qrCode,
@@ -83,8 +94,6 @@ export default class CreateSessionUtil {
 
     qrCode = qrCode.replace('data:image/png;base64,', '');
     const imageBuffer = Buffer.from(qrCode, 'base64');
-
-    fs.writeFileSync(`${client.session}.png`, imageBuffer);
 
     req.io.emit('qrCode', {
       data: 'data:image/png;base64,' + imageBuffer.toString('base64'),
@@ -108,6 +117,7 @@ export default class CreateSessionUtil {
       Object.assign(client, { status: 'CONNECTED', qrcode: null });
 
       req.logger.info(`Started Session: ${client.session}`);
+      //callWebHook(client, req, 'session-logged', { status: 'CONNECTED'});
       req.io.emit('session-logged', { status: true, session: client.session });
       startHelper(client, req);
     } catch (error) {
@@ -140,6 +150,7 @@ export default class CreateSessionUtil {
 
   async listenMessages(client, req) {
     await client.onMessage(async (message) => {
+      eventEmitter.emit(`mensagem-${client.session}`, client, message);
       callWebHook(client, req, 'onmessage', message);
       if (message.type === 'location')
         client.onLiveLocation(message.sender.id, (location) => {
@@ -155,6 +166,10 @@ export default class CreateSessionUtil {
       }
 
       req.io.emit('received-message', { response: message });
+    });
+
+    await client.onIncomingCall(async (call) => {
+      callWebHook(client, req, 'incomingcall', call);
     });
   }
 
